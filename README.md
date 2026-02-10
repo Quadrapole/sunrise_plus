@@ -118,6 +118,10 @@ MonitorIsOffLogLine = "Error: Couldn't find monitor"
 EncoderFailedLogLine = "Fatal: Unable to find display or encoder during startup."
 
 WakeMonitorSleepSeconds = 10
+
+# ⚠️ IMPORTANT: Direct commands are deprecated! ⚠️
+# Sunrise Plus now prefers systemd for proper process management.
+# These are only used as fallbacks when systemd is unavailable:
 StopSunshineCommand = "/usr/bin/killall sunshine"
 StartSunshineCommand = "/usr/bin/sunshine"
 
@@ -129,6 +133,8 @@ WakeMonitorCommand = "/usr/bin/ydotool mousemove -- 1 1"
 # Enable encoder failure restart
 RestartOnEncoderFailure = true
 ```
+
+**Note on Process Management:** Sunrise Plus automatically detects and uses systemd when available. Direct commands (`StopSunshineCommand`/`StartSunshineCommand`) are only used as fallbacks. Using systemd prevents zombie process accumulation.
 
 ### Start Service
 
@@ -159,21 +165,40 @@ If you're getting 503 errors when trying to connect:
 3. Check if Sunrise is running: `systemctl --user status sunrise`
 4. Check Sunrise logs: `journalctl --user -u sunrise -n 20`
 
-### Zombie Processes
+### Zombie Processes & Proper Process Management
 
-If Sunshine becomes a zombie (defunct process):
+**The Bug:** When restarting Sunshine using direct commands (`killall` + direct process execution), crashed processes become **zombies** (defunct processes) that block new connections and cause 503 errors.
+
+**Why This Happens:** 
+- The original Sunrise used `StartSunshineCommand = "/usr/bin/sunshine"` which creates orphaned processes
+- When Sunshine crashes, these processes become zombies because no parent calls `wait()` on them
+- Accumulated zombies block ports and prevent new connections
+
+**The Fix:** Sunrise Plus now:
+1. **Prefers systemd** for all start/stop operations (proper process reaping)
+2. **Explicitly kills all processes** by PID read from `/proc` when systemd is unavailable
+3. **Uses goroutines with `cmd.Wait()`** when direct execution is necessary
+4. **Verifies processes actually terminated** before starting new ones
+
+**If you see zombie processes:**
 
 ```bash
 # Check for zombies
 ps aux | grep sunshine
 
 # If you see: [sunshine] <defunct>
-# Stop sunrise (which reaps the zombie), then restart:
+# Restart via systemd (properly reaps zombies):
+systemctl --user restart sunrise
+
+# Or manually clean up:
 systemctl --user stop sunrise
 killall -9 sunshine  # Force kill if needed
-sunshine &  # Start manually or via sunrise
+truncate -s 0 ~/.config/sunshine/sunshine.log  # Clear logs
+systemctl --user start sunshine
 systemctl --user start sunrise
 ```
+
+**Important:** Always use `systemctl --user restart sunshine` instead of `killall` + manual restart when possible. Systemd properly reaps child processes and prevents zombie accumulation.
 
 ### Encoder Failures on NVIDIA + Wayland
 
@@ -255,6 +280,7 @@ Continue        Wait & continue
 6. **Self-healing log corruption**: Detects buffer overflow, clears log, restarts Sunshine
 7. **Increased buffer size**: 1MB (up from 64KB) to handle larger lines before triggering self-healing
 8. **Daily log cleanup**: Systemd timer to prevent log growth (optional)
+9. **Proper process management**: 8-step restart sequence with zombie reaping and systemd integration
 
 ### Why This Matters
 
@@ -274,6 +300,43 @@ When Sunshine crashes or encounters certain DRM/KMS errors, it can output binary
 4. **No Crash Loop**: Instead of systemd restarting a crashing Sunrise 365+ times, Sunrise fixes itself and continues
 
 **Result**: Unattended reliability - even if Sunshine outputs garbage, Sunrise Plus recovers automatically.
+
+### Process Management & Zombie Prevention
+
+**The Problem:**
+The original Sunrise used `killall sunshine` followed by direct process execution (`sunshine &`). When Sunshine crashed:
+1. The killed process became a zombie (defunct) because no parent called `wait()`
+2. Repeated crashes accumulated zombie processes
+3. Zombies blocked network ports and prevented new connections
+4. Users got persistent 503 errors
+
+**The Solution:**
+Sunrise Plus implements an 8-step restart sequence:
+
+```
+restartSunshine()
+├── 1. Stop via systemd (preferred) or killall (fallback)
+├── 2. Wait 3s for graceful shutdown
+├── 3. Kill all processes by PID (reads /proc directly)
+├── 4. Wait 5s for termination
+├── 5. Verify no processes remain (force kill if needed)
+├── 6. Clear logs for fresh start
+├── 7. Start via systemd (preferred) or direct command
+└── 8. Verify sunshine actually started
+```
+
+**Key improvements:**
+- **Systemd integration**: Automatically detects and uses `systemctl --user stop/start sunshine` when available
+- **PID-based killing**: Reads `/proc/[pid]/comm` to find and kill every sunshine process including zombies
+- **Graduated kill strategy**: SIGTERM first, then SIGKILL for stragglers
+- **Async reaping**: When using direct commands, uses goroutine with `cmd.Wait()` to prevent zombies
+- **Verification**: Actually confirms processes terminated before starting new ones
+
+**Why systemd matters:**
+- Systemd tracks processes via cgroups, not just PIDs
+- When a service stops, systemd reaps all child processes automatically
+- No zombie accumulation even with repeated crashes
+- Better logging via `journalctl --user -u sunshine`
 
 ---
 
