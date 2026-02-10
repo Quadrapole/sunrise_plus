@@ -112,6 +112,7 @@ func isMonitorSleeping() (isSleeping bool, err error) {
 	var latestOccurrence time.Time
 
 	scanner := bufio.NewScanner(logFile)
+	scanner.Buffer(make([]byte, 1024), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.Contains(line, c.MonitorIsOffLogLine) {
@@ -130,6 +131,10 @@ func isMonitorSleeping() (isSleeping bool, err error) {
 	}
 
 	if err := scanner.Err(); err != nil {
+		if isBufferOverflow(err) {
+			log.Println("Detected corrupted log with lines too long - clearing log and restarting sunshine")
+			return false, handleCorruptedLog()
+		}
 		return false, err
 	}
 
@@ -146,6 +151,22 @@ func isMonitorSleeping() (isSleeping bool, err error) {
 
 	log.Println("Monitor sleep already handled at", lastMonitorMissingTime.Format(time.RFC3339Nano))
 	return false, nil
+}
+
+// isBufferOverflow checks if scanner error is due to token too long
+func isBufferOverflow(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "token too long")
+}
+
+// handleCorruptedLog clears the log and restarts sunshine
+func handleCorruptedLog() error {
+	log.Println("Truncating corrupted sunshine log")
+	if err := os.Truncate(c.SunshineLogPath, 0); err != nil {
+		log.Println("Failed to truncate log:", err)
+		return err
+	}
+	log.Println("Log truncated successfully, restarting sunshine")
+	return restartSunshine()
 }
 
 // isEncoderFailed checks for encoder initialization failures
@@ -167,6 +188,7 @@ func isEncoderFailed() (failed bool, err error) {
 	var latestOccurrence time.Time
 
 	scanner := bufio.NewScanner(logFile)
+	scanner.Buffer(make([]byte, 1024), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.Contains(line, c.EncoderFailedLogLine) {
@@ -185,6 +207,10 @@ func isEncoderFailed() (failed bool, err error) {
 	}
 
 	if err := scanner.Err(); err != nil {
+		if isBufferOverflow(err) {
+			log.Println("Detected corrupted log with lines too long - clearing log and restarting sunshine")
+			return false, handleCorruptedLog()
+		}
 		return false, err
 	}
 
