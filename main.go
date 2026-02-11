@@ -2,11 +2,13 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -266,34 +268,197 @@ func waitForMonitor() {
 	time.Sleep(time.Duration(c.WakeMonitorSleepSeconds) * time.Second)
 }
 
-func restartSunshine() (err error) {
-	stopSunshine()
-	err = startSunshine()
-	if err != nil {
-		return err
+func restartSunshine() error {
+	log.Println("=== Starting Sunshine restart sequence ===")
+
+	if err := stopSunshineProperly(); err != nil {
+		log.Println("Warning: stopSunshine encountered error:", err)
 	}
+
+	log.Println("Waiting 3 seconds for graceful shutdown...")
+	time.Sleep(3 * time.Second)
+
+	if err := killAllSunshineProcesses(); err != nil {
+		log.Println("Warning: killAllSunshineProcesses encountered error:", err)
+	}
+
+	waitSeconds := 5
+	log.Printf("Waiting %d seconds for processes to terminate...", waitSeconds)
+	time.Sleep(time.Duration(waitSeconds) * time.Second)
+
+	if count := countSunshineProcesses(); count > 0 {
+		log.Printf("Warning: %d sunshine process(es) still remain after kill", count)
+		forceKillAllSunshine()
+		time.Sleep(2 * time.Second)
+	}
+
+	log.Println("Clearing sunshine logs for fresh start...")
+	if err := os.Truncate(c.SunshineLogPath, 0); err != nil {
+		log.Println("Warning: could not truncate log:", err)
+	}
+
+	log.Println("Starting sunshine...")
+	if err := startSunshineProperly(); err != nil {
+		return fmt.Errorf("failed to start sunshine: %w", err)
+	}
+
+	log.Println("Waiting 5 seconds for sunshine to initialize...")
+	time.Sleep(5 * time.Second)
+
+	if count := countSunshineProcesses(); count == 0 {
+		return fmt.Errorf("sunshine failed to start (no processes found)")
+	} else {
+		log.Printf("Sunshine restart complete - %d process(es) running", count)
+	}
+
 	return nil
 }
 
-func stopSunshine() {
-	stopSunshineCommandAndArgs := strings.Split(c.StopSunshineCommand, " ")
-	stopSunshineCMD := exec.Command(stopSunshineCommandAndArgs[0], stopSunshineCommandAndArgs[1:]...)
-	log.Println("Running stopSunshine command:", stopSunshineCMD.String())
-	err := stopSunshineCMD.Run()
-	if err != nil {
-		log.Println("stopSunshine encountered an error - ignoring:", err)
+func stopSunshineProperly() error {
+	if systemdAvailable() {
+		log.Println("Stopping sunshine via systemd...")
+		cmd := exec.Command("systemctl", "--user", "stop", "sunshine")
+		if err := cmd.Run(); err != nil {
+			log.Println("systemctl stop failed, falling back to killall:", err)
+		} else {
+			log.Println("systemctl stop completed")
+			return nil
+		}
 	}
-	log.Println("stopSunshine command completed without errors")
+
+	log.Println("Stopping sunshine via configured command...")
+	parts := strings.Fields(c.StopSunshineCommand)
+	if len(parts) == 0 {
+		return fmt.Errorf("no stop command configured")
+	}
+	cmd := exec.Command(parts[0], parts[1:]...)
+	return cmd.Run()
 }
 
-func startSunshine() (err error) {
-	startSunshineCommandAndArgs := strings.Split(c.StartSunshineCommand, " ")
-	startSunshineCMD := exec.Command(startSunshineCommandAndArgs[0], startSunshineCommandAndArgs[1:]...)
-	log.Println("Running startSunshine command:", startSunshineCMD.String())
-	err = startSunshineCMD.Start()
-	if err != nil {
+func startSunshineProperly() error {
+	if systemdAvailable() {
+		log.Println("Starting sunshine via systemd...")
+		cmd := exec.Command("systemctl", "--user", "start", "sunshine")
+		if err := cmd.Run(); err != nil {
+			log.Println("systemctl start failed, falling back to direct command:", err)
+		} else {
+			log.Println("systemctl start completed")
+			return nil
+		}
+	}
+
+	log.Println("Starting sunshine via configured command...")
+	parts := strings.Fields(c.StartSunshineCommand)
+	if len(parts) == 0 {
+		return fmt.Errorf("no start command configured")
+	}
+	cmd := exec.Command(parts[0], parts[1:]...)
+
+	if err := cmd.Start(); err != nil {
 		return err
 	}
-	log.Println("startSunshine command completed without errors")
+
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			log.Printf("Sunshine process exited with error: %v", err)
+		}
+	}()
+
 	return nil
+}
+
+func killAllSunshineProcesses() error {
+	log.Println("Killing all sunshine processes...")
+
+	pids := getSunshinePIDs()
+	if len(pids) == 0 {
+		log.Println("No sunshine processes found")
+		return nil
+	}
+
+	log.Printf("Found %d sunshine process(es) to kill: %v", len(pids), pids)
+
+	for _, pid := range pids {
+		log.Printf("Sending SIGTERM to PID %d...", pid)
+		if err := killProcess(pid, 15); err != nil {
+			log.Printf("SIGTERM to PID %d failed: %v", pid, err)
+		}
+	}
+
+	time.Sleep(2 * time.Second)
+
+	remainingPids := getSunshinePIDs()
+	if len(remainingPids) > 0 {
+		log.Printf("Force killing %d remaining process(es): %v", len(remainingPids), remainingPids)
+		for _, pid := range remainingPids {
+			if err := killProcess(pid, 9); err != nil {
+				log.Printf("SIGKILL to PID %d failed: %v", pid, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func forceKillAllSunshine() {
+	log.Println("Force killing all sunshine processes with SIGKILL...")
+	cmd := exec.Command("killall", "-9", "sunshine")
+	cmd.Run()
+}
+
+func getSunshinePIDs() []int {
+	var pids []int
+
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		log.Println("Could not read /proc:", err)
+		return pids
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+
+		commPath := fmt.Sprintf("/proc/%d/comm", pid)
+		data, err := os.ReadFile(commPath)
+		if err != nil {
+			continue
+		}
+
+		processName := strings.TrimSpace(string(data))
+		if processName == "sunshine" {
+			pids = append(pids, pid)
+		}
+	}
+
+	return pids
+}
+
+func killProcess(pid int, signal int) error {
+	cmd := exec.Command("kill", fmt.Sprintf("-%d", signal), strconv.Itoa(pid))
+	return cmd.Run()
+}
+
+func countSunshineProcesses() int {
+	return len(getSunshinePIDs())
+}
+
+func systemdAvailable() bool {
+	cmd := exec.Command("systemctl", "--user", "is-system-running")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = nil
+
+	if err := cmd.Run(); err != nil {
+		return false
+	}
+
+	status := strings.TrimSpace(out.String())
+	return status == "running" || status == "degraded"
 }
