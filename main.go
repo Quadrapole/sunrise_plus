@@ -31,6 +31,7 @@ type config struct {
 	SunshineLogPath         string
 	MonitorIsOffLogLine     string
 	EncoderFailedLogLine    string
+	EncoderFailedLogLine2   string
 	WakeMonitorSleepSeconds int
 	StopSunshineCommand     string
 	StartSunshineCommand    string
@@ -193,7 +194,8 @@ func isEncoderFailed() (failed bool, err error) {
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.Contains(line, c.EncoderFailedLogLine) {
+		if !strings.Contains(line, c.EncoderFailedLogLine) &&
+			!strings.Contains(line, c.EncoderFailedLogLine2) {
 			continue
 		}
 
@@ -271,6 +273,33 @@ func waitForMonitor() {
 func restartSunshine() error {
 	log.Println("=== Starting Sunshine restart sequence ===")
 
+	if systemdAvailable() {
+		log.Println("Using systemctl restart sunshine...")
+		cmd := exec.Command("systemctl", "--user", "restart", "sunshine")
+		if err := cmd.Run(); err != nil {
+			log.Println("systemctl restart failed, falling back to manual restart:", err)
+			return restartSunshineManual()
+		}
+		log.Println("systemctl restart completed")
+
+		if err := waitForServiceActive("sunshine", 30); err != nil {
+			return fmt.Errorf("sunshine service did not become active: %w", err)
+		}
+
+		log.Println("Clearing sunshine logs...")
+		if err := os.Truncate(c.SunshineLogPath, 0); err != nil {
+			log.Println("Warning: could not truncate log:", err)
+		}
+
+		return nil
+	}
+
+	return restartSunshineManual()
+}
+
+func restartSunshineManual() error {
+	log.Println("Using manual process restart...")
+
 	if err := stopSunshineProperly(); err != nil {
 		log.Println("Warning: stopSunshine encountered error:", err)
 	}
@@ -287,12 +316,12 @@ func restartSunshine() error {
 	time.Sleep(time.Duration(waitSeconds) * time.Second)
 
 	if count := countSunshineProcesses(); count > 0 {
-		log.Printf("Warning: %d sunshine process(es) still remain after kill", count)
+		log.Printf("Warning: %d sunshine process(es) still remain", count)
 		forceKillAllSunshine()
 		time.Sleep(2 * time.Second)
 	}
 
-	log.Println("Clearing sunshine logs for fresh start...")
+	log.Println("Clearing sunshine logs...")
 	if err := os.Truncate(c.SunshineLogPath, 0); err != nil {
 		log.Println("Warning: could not truncate log:", err)
 	}
@@ -306,12 +335,26 @@ func restartSunshine() error {
 	time.Sleep(5 * time.Second)
 
 	if count := countSunshineProcesses(); count == 0 {
-		return fmt.Errorf("sunshine failed to start (no processes found)")
-	} else {
-		log.Printf("Sunshine restart complete - %d process(es) running", count)
+		return fmt.Errorf("sunshine failed to start")
 	}
 
+	log.Printf("Sunshine restart complete")
 	return nil
+}
+
+func waitForServiceActive(serviceName string, timeoutSeconds int) error {
+	log.Printf("Waiting up to %d seconds for %s to be active...", timeoutSeconds, serviceName)
+
+	for i := 0; i < timeoutSeconds; i++ {
+		cmd := exec.Command("systemctl", "--user", "is-active", serviceName)
+		if err := cmd.Run(); err == nil {
+			log.Printf("Service %s is active", serviceName)
+			return nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	return fmt.Errorf("timeout waiting for %s", serviceName)
 }
 
 func stopSunshineProperly() error {
@@ -455,10 +498,7 @@ func systemdAvailable() bool {
 	cmd.Stdout = &out
 	cmd.Stderr = nil
 
-	if err := cmd.Run(); err != nil {
-		return false
-	}
-
+	cmd.Run()
 	status := strings.TrimSpace(out.String())
 	return status == "running" || status == "degraded"
 }

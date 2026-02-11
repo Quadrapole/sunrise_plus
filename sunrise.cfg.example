@@ -1,23 +1,10 @@
-# How often sunrise should check the sunshine log file
 SunriseCheckSeconds = 10
-# The log path sunrise will watch
-SunshineLogPath = "/home/your-username/.config/sunshine/sunshine.log"
-# The error sunrise will monitor for (pun-intended)
-MonitorIsOffLogLine = "Error: Couldn't find monitor [0]"
-# How long sunrise should wait after issuing the `wakeMonitorCommand`
+SunshineLogPath = "/home/alva/.config/sunshine/sunshine.log"
+MonitorIsOffLogLine = "Error: Couldn't find monitor"
+EncoderFailedLogLine = "Fatal: Unable to find display or encoder during startup."
+EncoderFailedLogLine2 = "Error: Video failed to find working encoder"
 WakeMonitorSleepSeconds = 10
-# The command sunrise will use to kill existing sunshine processes
 StopSunshineCommand = "/usr/bin/killall sunshine"
-# The command sunrise will use to start a new sunshine process
 StartSunshineCommand = "/usr/bin/sunshine"
-# Controls whether or not sunrise should restart sunshine
-# after waiting for the monitor to wake up.
-EnableSunshineRestart = false
-
-# The command sunrise will run to wake up your monitor
-# Working on Debian Trixie with KDE:
-WakeMonitorCommand = "/usr/bin/qdbus6 org.kde.Solid.PowerManagement /org/kde/Solid/PowerManagement org.kde.Solid.PowerManagement.wakeup"
-# Working on GNOME Wayland with ydotool configured
-# Ref: https://github.com/samurailink3/sunrise/issues/1#issue-3559225159
-# Ref: https://github.com/ReimuNotMoe/ydotool
-# WakeMonitorCommand = "/usr/bin/ydotool mousemove --absolute 355 0"
+WakeMonitorCommand = "/usr/bin/ydotool mousemove -- 1 1"
+RestartOnEncoderFailure = true
