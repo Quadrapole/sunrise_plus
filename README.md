@@ -16,6 +16,7 @@ The great [Sunshine](https://app.lizardbyte.dev/Sunshine/) game stream applicati
 2. **Encoder Failure Issue**: Sunshine sometimes fails to initialize video encoders (nvenc, vaapi, software), causing **503 errors** when trying to connect
 3. **Zombie Process Issue**: When Sunshine crashes repeatedly, it can become a defunct zombie process that blocks new connections
 4. **Log Corruption Issue**: Sunshine can output binary/corrupted data creating massive 4MB+ single lines, crashing log parsers
+5. **Wake-on-Connect Issue**: Sunshine doesn't wake the monitor proactively when users try to connect from Moonlight
 
 **Sunrise Plus** solves all four problems with **conditional restart logic** and **self-healing**:
 
@@ -25,6 +26,8 @@ The great [Sunshine](https://app.lizardbyte.dev/Sunshine/) game stream applicati
 | Encoder Failure (`"Fatal: Unable to find display or encoder"`) | **Restart Sunshine** | Encoder initialization failed, needs full restart |
 | Session Error (`"Error: Failed to create session:"`) | Wake monitor only | Display power issue, not encoder problem |
 | **Log Corruption** (lines > 1MB) | **Clear log & restart** | Binary data in log crashes parser |
+| **Wake-on-Connect** | Wake monitor → wait 15s → check success | Monitor + GPU need time to initialize |
+| **No "Starting main loop"** | **Restart via systemctl only** | Sunshine didn't initialize properly |
 
 ---
 
@@ -64,6 +67,18 @@ Sunshine crashes and outputs 4MB of binary data on one line
 → Original Sunrise: Crashes with "token too long" error, enters restart loop
 → Sunrise Plus: Detects corrupted log, clears it, restarts Sunshine
 → Service recovers automatically, no manual fix needed!
+```
+
+*Wake-on-Connect:*
+```
+User launches Moonlight to connect
+→ Sunshine logs show connection attempt activity
+→ Sunrise detects activity, wakes monitor with ydotool
+→ Waits 15 seconds for GPU initialization
+→ Checks for "Starting main loop" success message
+→ If found: Sunshine is ready, user connects successfully!
+→ If NOT found: Restarts Sunshine via systemctl only
+→ No more manual wake-ups or 503 errors!
 ```
 
 ---
@@ -116,6 +131,7 @@ MonitorIsOffLogLine = "Error: Couldn't find monitor"
 
 # Encoder failure - restarts Sunshine automatically
 EncoderFailedLogLine = "Fatal: Unable to find display or encoder during startup."
+EncoderFailedLogLine2 = "Error: Video failed to find working encoder"
 
 WakeMonitorSleepSeconds = 10
 
@@ -239,7 +255,8 @@ systemctl --user start clean-sunshine-log.timer
 | `SunriseCheckSeconds` | 10 | How often to check logs (seconds) |
 | `SunshineLogPath` | `""` | Path to sunshine.log |
 | `MonitorIsOffLogLine` | `""` | Pattern for monitor sleep errors |
-| `EncoderFailedLogLine` | `""` | Pattern for encoder failures |
+| `EncoderFailedLogLine` | `""` | Pattern for encoder failures (primary) |
+| `EncoderFailedLogLine2` | `""` | Pattern for encoder failures (secondary) |
 | `WakeMonitorSleepSeconds` | 10 | Wait time after waking monitor |
 | `WakeMonitorCommand` | `""` | Command to wake display |
 | `StopSunshineCommand` | `""` | Command to stop Sunshine |
@@ -255,15 +272,20 @@ Sunrise Plus runs every N seconds
        ↓
 Check Sunshine logs
        ↓
-┌─────────────────┬─────────────────┐
-↓                 ↓                 ↓
-Monitor Sleep   Encoder Failure   Nothing
-"Couldn't       "Unable to find    detected
-find monitor"   display or encoder"
-       ↓                 ↓
-Wake monitor    Restart Sunshine
-       ↓                 ↓
-Continue        Wait & continue
+┌─────────────────┬─────────────────┬─────────────────┐
+↓                 ↓                 ↓                 ↓
+Monitor Sleep   Encoder Failure   Log Activity      Nothing
+"Couldn't       "Unable to find    (connection      detected
+find monitor"   display or encoder" attempt)          │
+       ↓                 ↓                 ↓                 │
+Wake monitor    Restart Sunshine   Wake monitor          │
+       ↓                 ↓                 ↓                 │
+Continue        Wait & continue    Wait 15s              │
+                                    ↓                      │
+                          Check "Starting main loop"       │
+                                    ↓                      │
+                          Found? → IDLE (ready!)           │
+                          Not found → systemctl restart   │
 ```
 
 ---
@@ -273,7 +295,7 @@ Continue        Wait & continue
 ### Changes from Original Sunrise
 
 1. **Split error handling**: Separate functions for `isMonitorSleeping()` and `isEncoderFailed()`
-2. **New config options**: `EncoderFailedLogLine` and `RestartOnEncoderFailure`
+2. **New config options**: `EncoderFailedLogLine`, `EncoderFailedLogLine2`, and `RestartOnEncoderFailure`
 3. **Independent tracking**: `lastEncoderFailureTime` separate from `lastMonitorMissingTime`
 4. **Better logging**: Shows which patterns are being monitored
 5. **Conditional logic**: Monitor wake only for sleep errors, restart only for encoder failures
@@ -281,6 +303,9 @@ Continue        Wait & continue
 7. **Increased buffer size**: 1MB (up from 64KB) to handle larger lines before triggering self-healing
 8. **Daily log cleanup**: Systemd timer to prevent log growth (optional)
 9. **Proper process management**: 8-step restart sequence with zombie reaping and systemd integration
+10. **Wake-on-Connect**: Reactive monitor wake with 15-second GPU initialization wait
+11. **Systemctl-only restart**: No fallback to killall, prevents zombie accumulation
+12. **Success detection**: Verifies "Starting main loop" before considering Sunshine ready
 
 ### Why This Matters
 
@@ -300,6 +325,48 @@ When Sunshine crashes or encounters certain DRM/KMS errors, it can output binary
 4. **No Crash Loop**: Instead of systemd restarting a crashing Sunrise 365+ times, Sunrise fixes itself and continues
 
 **Result**: Unattended reliability - even if Sunshine outputs garbage, Sunrise Plus recovers automatically.
+
+### Wake-on-Connect Feature
+
+**The Problem:**
+When users try to connect from Moonlight, the monitor may be asleep and Sunshine doesn't proactively wake it. Users see 503 errors even though Sunshine would work if the display were active.
+
+**The Solution:**
+Sunrise Plus implements intelligent wake-on-connect:
+
+1. **Activity Detection**: Monitors Sunshine logs for connection attempt activity (any new log entries when Sunshine was idle)
+2. **Proactive Wake**: When activity is detected, wakes the monitor using `WakeMonitorCommand` (ydotool, qdbus, etc.)
+3. **GPU Initialization Wait**: Waits 15 seconds for monitor + GPU to fully initialize
+4. **Success Verification**: Checks for "Starting main loop" message in Sunshine logs
+5. **Failure Recovery**: If success message not found, restarts Sunshine via `systemctl restart sunshine` (no fallback to killall)
+
+**State Machine:**
+```
+Idle → Activity detected → Wake monitor → Wait 15s
+                                        ↓
+                              "Starting main loop"? ──YES──→ Idle (ready!)
+                                        ↓ NO
+                              systemctl restart sunshine → Wait & continue
+```
+
+**Key Behaviors:**
+- **Reactive only**: Wakes on activity detection, not on timer
+- **15-second wait**: Gives GPU time to re-encoder after power-on
+- **Systemctl restart only**: No fallback to killall (prevents zombie processes)
+- **No success = restart**: If "Starting main loop" doesn't appear, Sunshine needs restart
+
+**Example Workflow:**
+```
+1. User clicks "Connect" in Moonlight
+2. Sunshine receives connection, writes to log
+3. Sunrise detects log activity at 10:30:00
+4. Sunrise executes: ydotool mousemove -- 1 1
+5. Monitor turns on
+6. Sunrise waits 15 seconds (10:30:00 - 10:30:15)
+7. Sunrise checks logs for "Starting main loop"
+8. FOUND: Sunshine is ready, user connects successfully!
+   NOT FOUND: systemctl restart sunshine, check again in next cycle
+```
 
 ### Process Management & Zombie Prevention
 
