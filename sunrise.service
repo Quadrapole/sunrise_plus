@@ -1,16 +1,24 @@
 [Unit]
-Description=Sunrise
-After=graphical-session.target
+Description=Sunrise - Sunshine monitor and restart service
+Documentation=https://github.com/Quadrapole/sunrise_plus
+# Start BEFORE sunshine so we can monitor its startup
+After=graphical-session.target ydotoold.service
+Before=sunshine.service
 BindsTo=graphical-session.target
 PartOf=graphical-session.target
 Requisite=graphical-session.target
+Wants=ydotoold.service
 ConditionEnvironment=DISPLAY
 ConditionEnvironment=XAUTHORITY
 
 [Service]
+Type=simple
 ExecStart=/opt/sunrise/sunrise
 Restart=on-failure
 RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sunrise
 
 [Install]
 WantedBy=graphical-session.target
